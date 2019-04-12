@@ -46,6 +46,7 @@ from model_utils.models import TimeStampedModel
 from opaque_keys.edx.django.models import CourseKeyField
 from opaque_keys.edx.keys import CourseKey
 from pytz import UTC
+from simple_history.models import HistoricalRecords
 from six import text_type
 from slumber.exceptions import HttpClientError, HttpServerError
 from user_util import user_util
@@ -1074,6 +1075,20 @@ class CourseEnrollmentManager(models.Manager):
         )
 
 
+class OrderLineHistoricalModel(models.Model):
+    """
+    Abstract model for history models that might store an order line ID.
+
+    To use this model you *must* have a `_order_line_id` property on the
+    parent model, which must be set independently in code for tracking.
+    See CourseEnrollment for an example.
+    """
+    order_line_id = models.BigIntegerField(null=True, db_index=True)
+
+    class Meta:
+        abstract = True
+
+
 # Named tuple for fields pertaining to the state of
 # CourseEnrollment for a user in a course.  This type
 # is used to cache the state in the request cache.
@@ -1095,6 +1110,9 @@ class CourseEnrollment(models.Model):
     .. no_pii:
     """
     MODEL_TAGS = ['course', 'is_active', 'mode']
+
+    # See _order_line_id below for information on this
+    __order_line_id = None
 
     user = models.ForeignKey(User, on_delete=models.CASCADE)
 
@@ -1119,6 +1137,19 @@ class CourseEnrollment(models.Model):
         else:
             self._course_id = value
 
+    # _order_line_id is a property to temporarily store order an order line
+    # if a CourseEnrollment is being added or changed due to ecommerce activity.
+    # It gets added to the HistoricalCourseEnrollment model entry for finance
+    # auditing purposes. See OrderLineHistoricalModel and
+    # student/signals/receivers.py:add_history_order_line_id for implementation.
+    @property
+    def _order_line_id(self):
+        return self.__order_line_id
+
+    @_order_line_id.setter
+    def _order_line_id(self, value):
+        self.__order_line_id = value
+
     created = models.DateTimeField(auto_now_add=True, null=True, db_index=True)
 
     # If is_active is False, then the student is not considered to be enrolled
@@ -1128,6 +1159,15 @@ class CourseEnrollment(models.Model):
     # Represents the modes that are possible. We'll update this later with a
     # list of possible values.
     mode = models.CharField(default=CourseMode.DEFAULT_MODE_SLUG, max_length=100)
+
+    # An audit row will be created for every change to a CourseEnrollment. This
+    # will create a new model behind the scenes - HistoricalCourseEnrollment and a
+    # table named 'student_courseenrollment_history'.
+    history = HistoricalRecords(
+        bases=[OrderLineHistoricalModel, ],
+        history_id_field=models.UUIDField(default=uuid.uuid4),
+        table_name='student_courseenrollment_history'
+    )
 
     objects = CourseEnrollmentManager()
 
@@ -1245,7 +1285,7 @@ class CourseEnrollment(models.Model):
         from courseware.access import has_access  # pylint: disable=import-error
         return not has_access(user, 'enroll', course)
 
-    def update_enrollment(self, mode=None, is_active=None, skip_refund=False):
+    def update_enrollment(self, mode=None, is_active=None, skip_refund=False, order_line_id=None):
         """
         Updates an enrollment for a user in a class.  This includes options
         like changing the mode, toggling is_active True/False, etc.
@@ -1255,6 +1295,9 @@ class CourseEnrollment(models.Model):
         This saves immediately.
 
         """
+        if order_line_id:
+            self._order_line_id = order_line_id
+
         activation_changed = False
         # if is_active is None, then the call to update_enrollment didn't specify
         # any value, so just leave is_active as it is
@@ -1354,7 +1397,7 @@ class CourseEnrollment(models.Model):
                 )
 
     @classmethod
-    def enroll(cls, user, course_key, mode=None, check_access=False):
+    def enroll(cls, user, course_key, mode=None, check_access=False, order_line_id=None):
         """
         Enroll a user in a course. This saves immediately.
 
@@ -1388,6 +1431,12 @@ class CourseEnrollment(models.Model):
 
         Also emits relevant events for analytics purposes.
         """
+        # If this is coming from an Ecommerce order, the order line if will be
+        # stored in the history table along with these changes. This is used for
+        # financial auditing, please see DE with questions.
+        if order_line_id:
+            cls._order_line_id = order_line_id
+
         if mode is None:
             mode = _default_course_mode(text_type(course_key))
         # All the server-side checks for whether a user is allowed to enroll.
@@ -1473,7 +1522,7 @@ class CourseEnrollment(models.Model):
             raise
 
     @classmethod
-    def unenroll(cls, user, course_id, skip_refund=False):
+    def unenroll(cls, user, course_id, skip_refund=False, order_line_id=None):
         """
         Remove the user from a given course. If the relevant `CourseEnrollment`
         object doesn't exist, we log an error but don't throw an exception.
@@ -1488,6 +1537,13 @@ class CourseEnrollment(models.Model):
         """
         try:
             record = cls.objects.get(user=user, course_id=course_id)
+
+            # If this is coming from an Ecommerce order, the order line if will be
+            # stored in the history table along with these changes. This is used for
+            # financial auditing, please see DE with questions.
+            if order_line_id:
+                record._order_line_id = order_line_id
+
             record.update_enrollment(is_active=False, skip_refund=skip_refund)
 
         except cls.DoesNotExist:
@@ -1667,9 +1723,9 @@ class CourseEnrollment(models.Model):
         """
         self.update_enrollment(is_active=False)
 
-    def change_mode(self, mode):
+    def change_mode(self, mode, order_line_id=None):
         """Changes this `CourseEnrollment` record's mode to `mode`.  Saves immediately."""
-        self.update_enrollment(mode=mode)
+        self.update_enrollment(mode=mode, order_line_id=order_line_id)
 
     def refundable(self, user_already_has_certs_for=None):
         """
